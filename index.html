@@ -1,0 +1,943 @@
+<!DOCTYPE html>
+<html lang="hr">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ZET Školjka LIVE</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
+
+<style>
+html,body,#map{
+height:100%;
+margin:0;
+background:#0b0f14;
+font-family:sans-serif;
+}
+
+.beta-vehicle-icon{
+pointer-events:auto;
+}
+
+</style>
+</head>
+
+<body>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/protobufjs/dist/protobuf.min.js"></script>
+
+<script>
+
+// 🔥 TVOJ WORKER
+const RT_URL     = "https://web-karta.web-karta.workers.dev/rt";
+const STATIC_URL = "https://web-karta.web-karta.workers.dev/static";
+
+let SHAPES = {};
+let TRIP_TO_SHAPE = {};
+let TRIP_HEADSIGN = {};
+let TRIP_STOPS = {};
+
+
+// karta
+const map = L.map('map').setView([45.81,15.98],13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+maxZoom:19
+}).addTo(map);
+
+const vehiclesLayer = L.layerGroup().addTo(map);
+let selectedVehicle = null;
+let routeLine = null;
+let selectedTripId = null;   // 👈 DODAJ OVO
+
+// ====== STANICE ======
+const stopsLayer = L.layerGroup().addTo(map);
+let STOPS = {};              // stop_id -> {name, lat, lon}
+let stopMarkers = {};        // stop_id -> marker
+let STOP_ARRIVALS = {};      // stop_id -> [{routeId, tripId, tEpoch}]...
+
+const history = {};
+const lastBearing = {};
+
+const markers = {};
+
+function getShapeBearingFromProgress(marker){
+  if(!marker) return null;
+
+  const tripId = marker.__tripId;
+  if(!tripId) return null;
+
+let shapeId = TRIP_TO_SHAPE[tripId];
+
+// 🔥 fallback ako RT nema tripId
+if(!shapeId){
+
+const routeId = marker.__routeId;
+
+  const foundTrip = Object.keys(TRIP_TO_SHAPE).find(t =>
+    t.startsWith(routeId)
+  );
+
+  if(foundTrip){
+    shapeId = TRIP_TO_SHAPE[foundTrip];
+  }
+}
+
+const shape = SHAPES[shapeId];
+
+  if(!shape) return null;
+
+  let i = marker.__shapeProgress;
+  if(i === undefined || i >= shape.length-1) return null;
+
+  const p1 = shape[i];
+  const p2 = shape[i+1];
+
+  const dLat = p2[0]-p1[0];
+  const dLon = p2[1]-p1[1];
+
+  return Math.atan2(dLat,dLon)*180/Math.PI + 90;
+}
+
+
+
+
+// ====== CSV HELPERS (GTFS zna imati navodnike i zareze u tekstu) ======
+function csvSplit(line){
+  const out = [];
+  let cur = '';
+  let inQ = false;
+  for(let i=0;i<line.length;i++){
+    const ch = line[i];
+    if(ch === '"'){
+      // "" -> doslovni navodnik
+      if(inQ && line[i+1] === '"') { cur += '"'; i++; }
+      else inQ = !inQ;
+      continue;
+    }
+    if(ch === ',' && !inQ){ out.push(cur); cur=''; continue; }
+    cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+function headerIndexMap(headerLine){
+  const cols = csvSplit(headerLine).map(s=>s.trim());
+  const m = {};
+  cols.forEach((c, i)=>{ m[c]=i; });
+  return m;
+}
+
+// ====== BETA ICON ======
+const BLUE = 'rgb(18,100,171)';
+
+function makeIcon(label, angleDeg){
+
+  const C = BLUE;
+
+  // Dimenzije SVG-a (ostaju iste)
+  const W = 64;
+  const H = 64;
+
+  // 🔵 ZET badge
+  const cx = 32;
+  const cy = 32;
+  const r  = 13.5;   // 👈 ostaje kako želiš
+
+  // ====== BETA STRELICA GEOMETRIJA ======
+  const gap   = -3;   // koliko ulazi u krug
+  const baseW = 16;   // širina baze
+  const baseH = 8;    // debljina
+  const tipL  = 12;   // dužina šiljka
+  const round = 5;    // zaobljenje
+
+  const baseY = cy - r - gap;
+  const tipY  = baseY - tipL;
+
+  const arrowPath = `
+    M ${cx - baseW/2} ${baseY}
+    L ${cx} ${tipY}
+    L ${cx + baseW/2} ${baseY}
+    Q ${cx + baseW/2 - round} ${baseY + baseH} ${cx} ${baseY + baseH}
+    Q ${cx - baseW/2 + round} ${baseY + baseH} ${cx - baseW/2} ${baseY}
+    Z
+  `;
+
+  const svg = `
+    <svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"
+      xmlns="http://www.w3.org/2000/svg">
+
+      <g transform="rotate(${(angleDeg||0)},${cx},${cy})">
+        <path d="${arrowPath}" fill="${C}"></path>
+      </g>
+
+      <circle
+        cx="${cx}" cy="${cy}" r="${r}"
+        fill="${C}" stroke="white" stroke-width="2.5"
+      />
+
+      <text
+        x="${cx}" y="${cy+5}"
+        text-anchor="middle"
+        font-size="13"
+        font-weight="700"
+        fill="white"
+        font-family="Arial, sans-serif"
+      >${label||'?'}</text>
+
+    </svg>
+  `;
+
+  return L.divIcon({
+    html: svg,
+    className:'beta-vehicle-icon',
+    iconSize:[W,H],
+    iconAnchor:[W/2,H/2]
+  });
+}
+
+
+// ====== LOAD PROTO SCHEMA ======
+let FeedMessage;
+
+async function loadProto(){
+const proto = await fetch("https://raw.githubusercontent.com/google/transit/master/gtfs-realtime/proto/gtfs-realtime.proto").then(r=>r.text());
+const root = protobuf.parse(proto).root;
+FeedMessage = root.lookupType("transit_realtime.FeedMessage");
+}
+
+let STATIC_ZIP = null;
+
+async function loadStaticZip(){
+  if(STATIC_ZIP) return STATIC_ZIP;
+
+  const res = await fetch(STATIC_URL);
+  const blob = await res.blob();
+
+  STATIC_ZIP = await JSZip.loadAsync(blob);
+  return STATIC_ZIP;
+}
+
+
+async function loadShapes(){
+
+const zip = await loadStaticZip();
+
+const txt = await zip.file("shapes.txt").async("string");
+
+const lines = txt.replace(/\r/g,'').split("\n").filter(Boolean);
+if(lines.length < 2) return;
+const idx = headerIndexMap(lines[0]);
+
+const iShape = idx.shape_id ?? 0;
+const iLat   = idx.shape_pt_lat ?? 1;
+const iLon   = idx.shape_pt_lon ?? 2;
+const iSeq   = idx.shape_pt_sequence ?? 3;
+
+const tmp = {};
+for(let i=1;i<lines.length;i++){
+  const p = csvSplit(lines[i]);
+  if(p.length < 4) continue;
+  const id = p[iShape];
+  const lat = parseFloat(p[iLat]);
+  const lon = parseFloat(p[iLon]);
+  const seq = parseInt(p[iSeq] ?? '0', 10);
+  if(!id || !Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+  if(!tmp[id]) tmp[id]=[];
+  tmp[id].push({seq, lat, lon});
+}
+
+Object.keys(tmp).forEach(id=>{
+  tmp[id].sort((a,b)=>a.seq-b.seq);
+  SHAPES[id] = tmp[id].map(o=>[o.lat, o.lon]);
+});
+
+console.log("Shapes loaded:",Object.keys(SHAPES).length);
+}
+
+async function loadTrips(){
+const zip = await loadStaticZip();
+
+  const txt = await zip.file("trips.txt").async("string");
+
+  const lines = txt.replace(/\r/g,'').split("\n").filter(Boolean);
+  if(lines.length < 2) return;
+  const idx = headerIndexMap(lines[0]);
+
+ const iTrip     = idx.trip_id;
+const iShape    = idx.shape_id;
+const iHeadsign = idx.trip_headsign;
+
+
+
+for(let i=1;i<lines.length;i++){
+  const p = csvSplit(lines[i]);
+  if(p.length < Math.max(iTrip, iShape) + 1) continue;
+
+  const tripId  = p[iTrip];
+  const shapeId = p[iShape];
+  const headsign = p[iHeadsign];   // 👈 DODAJ OVO
+
+  if(tripId && shapeId){
+    TRIP_TO_SHAPE[tripId] = shapeId;
+  }
+
+  // 👇 I OVO IDE TU
+  if(tripId && headsign){
+    TRIP_HEADSIGN[tripId] = headsign;
+  }
+}
+
+  console.log("Trips loaded:", Object.keys(TRIP_TO_SHAPE).length);
+}
+
+async function loadStops(){
+  const zip = await loadStaticZip();
+
+  const txt = await zip.file("stops.txt").async("string");
+
+  const lines = txt.replace(/\r/g,'').split("\n").filter(Boolean);
+  if(lines.length < 2) return;
+  const idx = headerIndexMap(lines[0]);
+
+  const iId   = idx.stop_id ?? 0;
+  const iName = idx.stop_name ?? 2;
+  const iLat  = idx.stop_lat ?? 4;
+  const iLon  = idx.stop_lon ?? 5;
+
+  for(let i=1;i<lines.length;i++){
+    const p = csvSplit(lines[i]);
+    const stop_id = p[iId];
+    const name    = p[iName] || stop_id;
+    const lat     = parseFloat(p[iLat]);
+    const lon     = parseFloat(p[iLon]);
+    if(!stop_id || !Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    STOPS[stop_id] = {name, lat, lon};
+  }
+
+  console.log("Stops loaded:", Object.keys(STOPS).length);
+
+  // Marker-e crtamo tek kad user malo približi (da ne ubije mobitel)
+  const drawStopsIfNeeded = ()=>{
+    const z = map.getZoom();
+    const show = z >= 15;
+    if(!show){
+      stopsLayer.clearLayers();
+      return;
+    }
+    // nacrtaj samo jednom po zoom promjeni (jednostavno)
+    if(stopsLayer.getLayers().length) return;
+
+    Object.keys(STOPS).forEach(stop_id=>{
+      const s = STOPS[stop_id];
+      const m = L.circleMarker([s.lat, s.lon],{
+        radius: 4,
+        weight: 1,
+        opacity: 0.9,
+        fillOpacity: 0.6
+      }).addTo(stopsLayer);
+
+      stopMarkers[stop_id] = m;
+      m.on('click',()=>{
+        const html = stopPopupHTML(stop_id);
+        m.bindPopup(html, {maxWidth: 280}).openPopup();
+      });
+    });
+  };
+
+  map.on('zoomend', drawStopsIfNeeded);
+  drawStopsIfNeeded();
+}
+
+async function loadStopTimes(){
+
+  const zip = await loadStaticZip();
+
+  const txt = await zip.file("stop_times.txt").async("string");
+
+  const lines = txt.replace(/\r/g,'').split("\n").filter(Boolean);
+  if(lines.length < 2) return;
+
+  const idx = headerIndexMap(lines[0]);
+
+  const iTrip = idx.trip_id;
+  const iStop = idx.stop_id;
+  const iSeq  = idx.stop_sequence;
+
+  const tmp = {};
+
+  for(let i=1;i<lines.length;i++){
+
+    const p = csvSplit(lines[i]);
+
+    const tripId = p[iTrip];
+    const stopId = p[iStop];
+    const seq    = parseInt(p[iSeq]);
+
+    if(!tripId || !stopId) continue;
+
+    if(!tmp[tripId]) tmp[tripId] = [];
+    tmp[tripId].push({stopId, seq});
+  }
+
+  Object.keys(tmp).forEach(tripId=>{
+    tmp[tripId].sort((a,b)=>a.seq-b.seq);
+    TRIP_STOPS[tripId] = tmp[tripId].map(x=>x.stopId);
+  });
+
+  console.log("StopTimes loaded:", Object.keys(TRIP_STOPS).length);
+}
+
+
+function stopPopupHTML(stop_id){
+  const s = STOPS[stop_id];
+  const title = s ? s.name : stop_id;
+  const arr = (STOP_ARRIVALS[stop_id] || []).slice(0,6);
+  if(!arr.length){
+    return `<div style="min-width:240px"><b>${title}</b><br><span style="opacity:.8">Nema uskoro dolazaka (RT)</span></div>`;
+  }
+  const now = Date.now()/1000;
+  const rows = arr.map(a=>{
+    const min = Math.max(0, Math.round((a.tEpoch - now)/60));
+    return `<div style="display:flex;justify-content:space-between;gap:10px;margin-top:4px">
+      <div><b>${a.routeId || '?'}</b></div>
+      <div style="opacity:.9">⏱️: za ${min} min</div>
+    </div>`;
+  }).join('');
+  return `<div style="min-width:240px"><b>${title}</b>${rows}</div>`;
+}
+
+// ====== NEXT STOP PREDIKCIJA (SMJER + NAJBLIŽA STANICA) ======
+// ====== NEXT STOP PREDIKCIJA (SMJER + BUFFER) ======
+// ====== NEXT STOP PREDIKCIJA S BUFFEROM ======
+
+// 🔥 cache za položaj stanica na shapeu
+const SHAPE_STOP_PROGRESS = {};
+
+function predictNextStop(marker, lat, lon, tripId){
+
+  const stops = TRIP_STOPS[tripId];
+  if(!stops || !stops.length) return null;
+
+  const shapeId = TRIP_TO_SHAPE[tripId];
+  const shape = SHAPES[shapeId];
+  if(!shape || shape.length < 2) return null;
+
+  // =========================================
+  // 🔥 1) PROGRESS vozila po SHAPE-u
+  // =========================================
+  let bestIndex = 0;
+  let bestDist = Infinity;
+
+  for(let i=0;i<shape.length;i++){
+    const dLat = shape[i][0] - lat;
+    const dLon = shape[i][1] - lon;
+    const d = dLat*dLat + dLon*dLon;
+    if(d < bestDist){
+      bestDist = d;
+      bestIndex = i;
+    }
+  }
+
+  marker.__shapeProgress = bestIndex;
+
+  // =========================================
+  // 🔥 2) CACHE progressa stanica
+  // =========================================
+  if(!SHAPE_STOP_PROGRESS[tripId]){
+
+    const map = {};
+
+    stops.forEach(stopId=>{
+      const s = STOPS[stopId];
+      if(!s) return;
+
+      let bestI = 0;
+      let bestD = Infinity;
+
+      for(let i=0;i<shape.length;i++){
+        const dLat = shape[i][0] - s.lat;
+        const dLon = shape[i][1] - s.lon;
+        const d = dLat*dLat + dLon*dLon;
+        if(d < bestD){
+          bestD = d;
+          bestI = i;
+        }
+      }
+
+      map[stopId] = bestI;
+    });
+
+    SHAPE_STOP_PROGRESS[tripId] = map;
+  }
+
+  const stopProg = SHAPE_STOP_PROGRESS[tripId];
+
+// =========================================
+// 🔥 3) GEOMETRIJSKI NAJBLIŽA STANICA ISPRED
+// =========================================
+
+let nextStopId = null;
+let bestStopDist = Infinity;
+
+
+stops.forEach(stopId=>{
+
+  const prog = stopProg[stopId];
+  if(prog === undefined) return;
+
+  // mora biti ISPRED vozila na shapeu
+  if(prog <= marker.__shapeProgress) return;
+
+  const s = STOPS[stopId];
+  if(!s) return;
+
+  const dLat = s.lat - lat;
+  const dLon = s.lon - lon;
+  const dist = dLat*dLat + dLon*dLon;
+
+if(dist < bestStopDist){
+  bestStopDist = dist;
+  nextStopId = stopId;
+}
+
+
+});
+
+
+  // ako nema dalje → terminus
+  if(!nextStopId){
+    return stops[stops.length-1];
+  }
+
+  return nextStopId;
+}
+
+
+
+
+function computeFallbackETA(marker, nextStopId){
+
+  if(!nextStopId) return null;
+  if(!history[marker.__vehicleId]) return null;
+
+  const pts = history[marker.__vehicleId];
+  if(!pts || pts.length < 3) return null;
+
+  // ===== izračun brzine =====
+  const p1 = pts[pts.length-3];
+  const p2 = pts[pts.length-1];
+
+  const dLat = p2[0] - p1[0];
+  const dLon = p2[1] - p1[1];
+
+  const distMove = Math.sqrt(dLat*dLat + dLon*dLon);
+
+  // sekunde između update-a (updateVehicles svakih 5s)
+  const speed = distMove / 10;  
+
+  if(speed <= 0) return null;
+
+  const stop = STOPS[nextStopId];
+  if(!stop) return null;
+
+  const dLat2 = stop.lat - p2[0];
+  const dLon2 = stop.lon - p2[1];
+  const distToStop = Math.sqrt(dLat2*dLat2 + dLon2*dLon2);
+
+  const etaSec = distToStop / speed;
+
+  if(!isFinite(etaSec)) return null;
+
+  return Math.round(etaSec/60);
+}
+
+
+
+
+function getArrivalText(stopId, tripId){
+
+  const arr = STOP_ARRIVALS[stopId];
+  if(!arr) return null;
+
+  const rec = arr.find(a => a.tripId === tripId);
+  if(!rec) return null;
+
+  const now = Date.now()/1000;
+  const min = Math.max(0, Math.round((rec.tEpoch - now)/60));
+
+  if(min <= 0) return "<1 min.";
+  if(min === 1) return "1 min.";
+  return `${min} min.`;
+}
+
+
+// ====== UPDATE VEHICLES ======
+async function updateVehicles(){
+const res = await fetch(RT_URL);
+const buffer = await res.arrayBuffer();
+
+const feed = FeedMessage.decode(new Uint8Array(buffer));
+
+// ====== REALTIME DOLASCI PO STANICAMA (iz trip_update) ======
+STOP_ARRIVALS = {};
+const nowEpoch = Math.floor(Date.now()/1000);
+feed.entity.forEach(ent=>{
+  const tu = ent.tripUpdate;
+  if(!tu) return;
+  const routeId = tu.trip?.routeId;
+  const tripId  = tu.trip?.tripId;
+  const stus = tu.stopTimeUpdate || [];
+  stus.forEach(stu=>{
+    const stopId = stu.stopId;
+    if(!stopId) return;
+    const t = (stu.arrival?.time ?? stu.departure?.time);
+    if(!t) return;
+    const tEpoch = Number(t);
+    if(!Number.isFinite(tEpoch) || tEpoch < nowEpoch - 60) return;
+    if(!STOP_ARRIVALS[stopId]) STOP_ARRIVALS[stopId] = [];
+    STOP_ARRIVALS[stopId].push({routeId, tripId, tEpoch});
+  });
+});
+Object.keys(STOP_ARRIVALS).forEach(k=>{
+  STOP_ARRIVALS[k].sort((a,b)=>a.tEpoch-b.tEpoch);
+});
+
+// ako je neki stop popup otvoren, osvježi sadržaj
+Object.keys(stopMarkers).forEach(stopId=>{
+  const m = stopMarkers[stopId];
+  if(m && m.getPopup && m.getPopup() && m.isPopupOpen && m.isPopupOpen()){
+    m.getPopup().setContent(stopPopupHTML(stopId));
+  }
+});
+
+// ====== NEXT STOP HELPER ======
+
+
+
+// ====== VOZILA ======
+feed.entity.forEach(ent=>{
+if(!ent.vehicle) return;
+
+
+const v = ent.vehicle;
+const id = v.vehicle?.id || ent.id;
+
+const lat = v.position.latitude;
+const lon = v.position.longitude;
+if(!history[id]) history[id]=[];
+history[id].push([lat,lon]);
+
+if(history[id].length>50) history[id].shift();
+
+let bearing = v.position?.bearing;
+
+// RT često šalje 0
+if(bearing === 0) bearing = undefined;
+
+// 1️⃣ pokušaj history smjer
+if((bearing === null || bearing === undefined) && history[id] && history[id].length>1){
+
+  const p1 = history[id][history[id].length-2];
+  const p2 = history[id][history[id].length-1];
+
+  const dLat = p2[0]-p1[0];
+  const dLon = p2[1]-p1[1];
+
+  if(Math.abs(dLat) > 1e-7 || Math.abs(dLon) > 1e-7){
+bearing = Math.atan2(dLat, dLon) * 180/Math.PI + 90;
+  }
+}
+
+// 2️⃣ 🔥 NOVO — fallback na SHAPE smjer (PRVI FRAME FIX)
+if(!Number.isFinite(bearing)){
+  const mm = markers[id];
+  bearing = getShapeBearingFromProgress(mm);
+}
+
+
+// 3️⃣ zadnja zaštita
+if(!Number.isFinite(bearing)){
+  bearing = lastBearing[id];
+}
+
+if(!Number.isFinite(bearing)){
+  bearing = lastBearing[id] ?? 0;
+}
+lastBearing[id] = bearing;
+
+
+
+const line = v.trip?.routeId || "?";
+
+if(!markers[id]){
+markers[id]=L.marker([lat,lon],{
+icon:makeIcon(line,bearing)
+})
+.addTo(vehiclesLayer)
+.bindPopup(() => {
+
+const ns = markers[id].__nextStopName;
+const headsign = markers[id].__headsign || "";
+
+return `
+<div style="min-width:220px">
+  <div style="font-weight:700;font-size:15px">
+    ${markers[id].__routeId || '?'} ${headsign}
+  </div>
+
+  <div style="margin-top:6px">
+    🚋:
+    <span style="opacity:.9">${ns || '—'}</span>
+  </div>
+
+  <div style="margin-top:4px;opacity:.85;font-size:13px">
+    ⏱️: ${markers[id].__arrivalText || '—'}
+  </div>
+</div>
+`;
+
+});
+
+// 🔥 KLJUČNO — postavi trip odmah, ne kasnije
+markers[id].__tripId = v.trip?.tripId || null;
+markers[id].__routeId = line;
+markers[id].__headsign =
+  (TRIP_HEADSIGN[v.trip?.tripId] || "").toUpperCase();
+
+markers[id].on('click',()=>{
+
+selectedVehicle=id;
+
+const tripId = markers[id].__tripId;
+
+console.log("CLICK TRIP:", tripId);
+
+selectedTripId = tripId;
+
+if(routeLine){
+  map.removeLayer(routeLine);
+  routeLine=null;
+}
+
+if(!tripId){
+  console.warn("NO TRIPID ON MARKER");
+  return;
+}
+
+const shapeId = TRIP_TO_SHAPE[tripId];
+const shape   = SHAPES[shapeId];
+
+console.log("SHAPEID:", shapeId, "points:", shape?.length);
+
+if(shape && shape.length>1){
+  routeLine = L.polyline(shape,{
+    color:'red',
+    weight:5
+  }).addTo(map);
+
+  map.fitBounds(routeLine.getBounds(),{padding:[20,20]});
+}else{
+  console.warn("NO SHAPE FOUND");
+}
+
+});
+
+
+markers[id].__vehicleId = id;
+
+
+
+}else{
+markers[id].setLatLng([lat,lon]);
+markers[id].setIcon(makeIcon(line,bearing));
+
+markers[id].__vehicleId = id;
+
+}
+
+// spremi zadnje RT podatke na marker (da click uvijek uzme najnovije)
+if(v.trip?.tripId){
+  markers[id].__tripId = v.trip.tripId;
+}
+if(markers[id].__lastTrip !== markers[id].__tripId){
+
+  // 🔥 RESET cijele logike stanica
+  markers[id].__stopIndex = undefined;
+  markers[id].__d2ToNext = undefined;
+  markers[id].__nextStopId = null;
+
+  markers[id].__lastTrip = markers[id].__tripId;
+}
+
+
+markers[id].__routeId = line;
+markers[id].__headsign =
+  (TRIP_HEADSIGN[v.trip?.tripId] || "").toUpperCase();
+
+
+
+// 🔥 BUFFER LOGIKA SLJEDEĆE STANICE
+const currentStopId = markers[id].__nextStopId;
+
+let nextStopId = predictNextStop(
+  markers[id],
+  lat,
+  lon,
+  v.trip?.tripId
+);
+
+// 🔥 sada imamo __shapeProgress pa možemo bearing
+if(!Number.isFinite(bearing)){
+  bearing = getShapeBearingFromProgress(markers[id]);
+}
+
+
+
+
+// ako je stigao → resetiraj da traži novu
+if(nextStopId === "__ARRIVED__"){
+  nextStopId = null;
+}
+
+// spremi novi kandidat
+markers[id].__nextStopId = nextStopId;
+
+// ime za popup
+markers[id].__nextStopName =
+  nextStopId ? (STOPS[nextStopId]?.name || nextStopId) : null;
+  markers[id].__etaText = null;
+
+// 🔥 prvo pokušaj RT ETA
+if(nextStopId && STOP_ARRIVALS[nextStopId]){
+
+  const arr = STOP_ARRIVALS[nextStopId]
+    .find(a => a.tripId === markers[id].__tripId);
+
+  if(arr){
+    const min = Math.max(0, Math.round((arr.tEpoch - Date.now()/1000)/60));
+    markers[id].__etaText = min <= 0 ? "<1 min." : `${min} min.`;
+  }
+}
+
+// 🔥 fallback ETA ako nema RT
+if(!markers[id].__etaText){
+
+  const eta = computeFallbackETA(markers[id], nextStopId);
+
+  if(eta !== null){
+    markers[id].__etaText = eta <= 0 ? "<1 min." : `${eta} min.`;
+  }
+}
+
+  markers[id].__arrivalText =
+  nextStopId ? getArrivalText(nextStopId, v.trip?.tripId) : null;
+
+  // 🔥 AUTOMATSKI REFRESH POPUPA AKO JE OTVOREN
+const m = markers[id];
+
+if(m.getPopup && m.getPopup() && m.isPopupOpen && m.isPopupOpen()){
+
+  const headsign = m.__headsign || "";
+
+  m.getPopup().setContent(`
+    <div style="min-width:220px">
+      <div style="font-weight:700;font-size:15px">
+        ${m.__routeId || '?'} ${headsign}
+      </div>
+      <div style="margin-top:6px">
+        🚋:
+        <span style="opacity:.9">${m.__nextStopName || '—'}</span>
+      </div>
+      <div style="margin-top:4px;opacity:.85;font-size:13px">
+  ⏱️: ${m.__arrivalText || '—'}
+</div>
+
+    </div>
+  `);
+}
+
+
+
+
+
+});
+
+
+// 🔥 DRŽI CIJELU TRASU NAKON REFRESH-a
+if(selectedTripId){
+
+const shapeId = TRIP_TO_SHAPE[selectedTripId];
+
+if(shapeId && SHAPES[shapeId] && SHAPES[shapeId].length > 1){
+
+if(routeLine){
+map.removeLayer(routeLine);
+}
+
+routeLine = L.polyline(SHAPES[shapeId],{
+color:'red',
+weight:5
+}).addTo(map);
+
+}
+
+}
+
+
+}
+
+// ====== INIT ======
+(async()=>{
+await loadProto();
+await loadShapes();
+await loadTrips();   // 🔥 BITNO za cijelu trasu
+await loadStops();   // 🔥 STANICE
+await loadStopTimes();
+
+
+updateVehicles();
+setInterval(updateVehicles,5000);
+setInterval(() => {
+  Object.values(markers).forEach(m => {
+    if(!m.__tripId) return;
+
+    const ll = m.getLatLng();
+    const nextStopId = predictNextStop(m, ll.lat, ll.lng, m.__tripId);
+
+    // samo ako se promijenilo
+    if(nextStopId && nextStopId !== m.__nextStopId){
+      m.__nextStopId = nextStopId;
+      m.__nextStopName = STOPS[nextStopId]?.name || nextStopId;
+      // ETA ostaje iz updateVehicles (RT/fallback), ali bar stanica se osvježi odmah
+      if(m.getPopup && m.getPopup() && m.isPopupOpen && m.isPopupOpen()){
+        const headsign = m.__headsign || "";
+        m.getPopup().setContent(`
+          <div style="min-width:220px">
+            <div style="font-weight:700;font-size:15px">
+              ${m.__routeId || '?'} ${headsign}
+            </div>
+            <div style="margin-top:6px">🚋:
+              <span style="opacity:.9">${m.__nextStopName || '—'}</span>
+            </div>
+            <div style="margin-top:4px;opacity:.85;font-size:13px">
+              ⏱️: ${m.__arrivalText || '—'}
+            </div>
+          </div>
+        `);
+      }
+    }
+  });
+}, 1000);
+
+})();
+
+
+
+</script>
+</body>
+</html>
